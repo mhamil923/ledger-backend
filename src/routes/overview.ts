@@ -83,6 +83,8 @@ overviewRouter.get('/', async (req, res) => {
       spent_this_month: envelope.summary.spent,
       uncategorized_count: envelope.summary.uncategorized_count,
       moved_to_trading_this_month: round2(investing ? -investing.activity : 0),
+      investing_envelope_available: investing ? investing.balance : null,
+      investing_envelope_budgeted: investing ? investing.budgeted : null,
     },
     trading: {
       capital_in_trades: round2(capitalInTrades),
