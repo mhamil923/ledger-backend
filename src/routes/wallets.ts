@@ -107,6 +107,17 @@ walletsRouter.get('/chains', (_req, res) => {
   });
 });
 
+/** Total USD value across all of a user's crypto wallets (for the overview). */
+export async function loadWalletsTotal(userId: string): Promise<number> {
+  const result = await query<WalletRow>(
+    `SELECT id, label, chain, address, last_synced_at::text, created_at::text
+     FROM crypto_wallets WHERE user_id = $1`,
+    [userId],
+  );
+  const wallets = await Promise.all(result.rows.map(toWalletWithBalances));
+  return wallets.reduce((acc, w) => acc + w.total_usd_value, 0);
+}
+
 walletsRouter.get('/', async (req, res) => {
   const userId = req.user!.id;
   const result = await query<WalletRow>(

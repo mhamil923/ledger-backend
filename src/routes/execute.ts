@@ -51,7 +51,7 @@ export type ExchangeAccount =
  * Lists all configured exchange accounts with current balances so the app can
  * show "from which account" pickers + buying-power figures in the trade modal.
  */
-executeRouter.get('/accounts', async (_req, res) => {
+export async function loadExchangeAccounts(): Promise<ExchangeAccount[]> {
   const result: ExchangeAccount[] = [];
 
   for (const env of ['paper', 'live'] as const) {
@@ -116,8 +116,11 @@ executeRouter.get('/accounts', async (_req, res) => {
     }
   }
   result.push(coinbase);
+  return result;
+}
 
-  res.json({ accounts: result });
+executeRouter.get('/accounts', async (_req, res) => {
+  res.json({ accounts: await loadExchangeAccounts() });
 });
 
 /**

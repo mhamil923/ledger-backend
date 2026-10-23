@@ -112,3 +112,59 @@ export function getTransferExclusionClause(paramIndex: number): {
   const clause = `AND NOT (COALESCE(description,'') ILIKE ANY($${paramIndex}) OR COALESCE(merchant,'') ILIKE ANY($${paramIndex}))`;
   return { clause, patterns };
 }
+
+/**
+ * Card-side description of a payment arriving on a credit card account
+ * ("AUTOMATIC PAYMENT - THANK YOU", "Payment Received", ...). Only meaningful
+ * for positive amounts on credit_card accounts — the other side of a card
+ * payoff, which must never count as income.
+ */
+const CARD_INFLOW_PATTERNS = [
+  /\bpayment\b.*\bthank you\b/i,
+  /\bthank you\b.*\bpayment\b/i,
+  /\bpayment received\b/i,
+  /\bautopay(ment)?\b/i,
+  /\bautomatic payment\b/i,
+  /\bonline payment\b/i,
+  /\bmobile payment\b/i,
+  /\bepayment\b/i,
+  /\bpayment\s*-?\s*(web|ach|online|mobile)\b/i,
+];
+
+export function isCardPaymentInflow(description: string | null | undefined, merchant: string | null | undefined): boolean {
+  const haystack = `${description ?? ''} ${merchant ?? ''}`;
+  return CARD_INFLOW_PATTERNS.some((p) => p.test(haystack));
+}
+
+/**
+ * "Money moving between my own accounts" wording, used only to confirm a
+ * candidate transfer PAIR (same amount, opposite sign, two of your own
+ * accounts, within a few days). Deliberately excludes payment apps
+ * (Zelle/Venmo) and the word "payment": a $50 Zelle to a friend next to an
+ * unrelated $50 deposit must not pair up. Card payoffs don't need this — the
+ * credit-card side of the pair already proves it.
+ */
+const TRANSFERISH = /\b(transfer|xfer|trnsfr|to sav|from sav|to chk|from chk|to checking|from checking|to savings|from savings|deposit from|withdrawal to|internal)\b/i;
+
+export function looksLikeTransfer(description: string | null | undefined, merchant: string | null | undefined): boolean {
+  return TRANSFERISH.test(`${description ?? ''} ${merchant ?? ''}`);
+}
+
+/**
+ * Normalize a merchant/description so charges from the same vendor group
+ * together regardless of store numbers, reference IDs and boilerplate.
+ */
+export function normalizeMerchant(raw: string): string {
+  return raw
+    .toUpperCase()
+    .replace(/[#*]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/\b[A-Z0-9]*\d{4,}[A-Z0-9]*\b/g, ' ')
+    .replace(
+      /\b(BILL\s*PAYMENT|BILL\s*PAY|RECURRING|ONLINE|PAYMENT|PURCHASE|DEBIT|ACH|WEB|POS|CARD|TRANSACTION|REF|INV)\b/g,
+      ' ',
+    )
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 40);
+}

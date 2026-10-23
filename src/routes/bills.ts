@@ -2,6 +2,52 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { query, withTransaction } from '../db.js';
 import { requireAuth } from '../auth/middleware.js';
+import { billMonthlyEquivalent, currentMonth } from '../services/envelope.js';
+import { processTransactions } from '../services/transaction-engine.js';
+
+/**
+ * Give a bill its own budget category in the "Bills" group, a rule that routes
+ * its charges there, and this month's budget = its monthly equivalent.
+ */
+async function linkBillToCategory(
+  client: import('pg').PoolClient,
+  userId: string,
+  bill: { id: string; name: string; merchant: string | null; amount: number; cadence: string },
+): Promise<string> {
+  const cat = await client.query<{ id: string }>(
+    `INSERT INTO categories (user_id, name, group_name)
+     VALUES ($1, $2, 'Bills')
+     ON CONFLICT (user_id, (lower(name))) DO UPDATE SET hidden = false
+     RETURNING id`,
+    [userId, bill.name],
+  );
+  const categoryId = cat.rows[0]!.id;
+  await client.query(`UPDATE bills SET category_id = $1 WHERE id = $2`, [categoryId, bill.id]);
+  await syncBillRule(client, userId, categoryId, bill);
+  await client.query(
+    `INSERT INTO category_budgets (category_id, month, budgeted) VALUES ($1, $2, $3)
+     ON CONFLICT (category_id, month) DO NOTHING`,
+    [categoryId, currentMonth(), billMonthlyEquivalent(bill.amount, bill.cadence)],
+  );
+  return categoryId;
+}
+
+async function syncBillRule(
+  client: import('pg').PoolClient,
+  userId: string,
+  categoryId: string,
+  bill: { name: string; merchant: string | null },
+): Promise<void> {
+  const value = (bill.merchant && bill.merchant.trim().length > 3 ? bill.merchant : bill.name).trim();
+  await client.query(`DELETE FROM category_rules WHERE category_id = $1 AND source = 'bill'`, [categoryId]);
+  if (value.length > 3) {
+    await client.query(
+      `INSERT INTO category_rules (user_id, stage, field, op, value, category_id, source)
+       VALUES ($1, 'post', 'any', 'contains', $2, $3, 'bill')`,
+      [userId, value, categoryId],
+    );
+  }
+}
 
 export const billsRouter = Router();
 billsRouter.use(requireAuth);
@@ -139,6 +185,10 @@ billsRouter.post('/', async (req, res) => {
     ],
   );
   const row = result.rows[0]!;
+  await withTransaction((client) =>
+    linkBillToCategory(client, userId, { ...row, amount: Number(row.amount) }),
+  );
+  await processTransactions(userId, { ai: false });
   res.status(201).json({
     bill: {
       ...row,
@@ -188,6 +238,23 @@ billsRouter.patch('/:id', async (req, res) => {
   if (result.rowCount === 0) {
     res.status(404).json({ error: 'Bill not found' });
     return;
+  }
+  if (updates.name !== undefined || updates.merchant !== undefined || updates.active !== undefined) {
+    const b = (
+      await query<{ id: string; name: string; merchant: string | null; amount: string; cadence: string; category_id: string | null; active: boolean }>(
+        `SELECT id, name, merchant, amount::text, cadence, category_id, active FROM bills WHERE id = $1`,
+        [req.params.id],
+      )
+    ).rows[0]!;
+    await withTransaction(async (client) => {
+      if (!b.category_id) {
+        if (b.active) await linkBillToCategory(client, userId, { ...b, amount: Number(b.amount) });
+        return;
+      }
+      if (b.active) await syncBillRule(client, userId, b.category_id, b);
+      else await client.query(`DELETE FROM category_rules WHERE category_id = $1 AND source = 'bill'`, [b.category_id]);
+    });
+    await processTransactions(userId, { ai: false });
   }
   res.json({ ok: true });
 });

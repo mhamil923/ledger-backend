@@ -7,6 +7,8 @@ const schema = z.object({
   DATABASE_URL: z.string().min(1, 'DATABASE_URL is required'),
   JWT_SECRET: z.string().min(32, 'JWT_SECRET must be at least 32 chars'),
   CORS_ORIGIN: z.string().default('*'),
+  /** Time zone that decides which month a transaction belongs to. */
+  BUDGET_TZ: z.string().default('America/Chicago'),
   ANTHROPIC_API_KEY: z.string().optional(),
   FINNHUB_API_KEY: z.string().optional(),
   COINGECKO_API_KEY: z.string().optional(),

@@ -12,7 +12,9 @@ import {
   encryptSecret,
   isBankingCryptoConfigured,
 } from '../services/crypto.js';
-import { isTransferOrPayment } from '../services/transactions-classify.js';
+import { normalizeMerchant } from '../services/transactions-classify.js';
+import { processTransactions } from '../services/transaction-engine.js';
+import { TXN_SELECT } from './transactions.js';
 
 export const bankingRouter = Router();
 bankingRouter.use(requireAuth);
@@ -107,13 +109,28 @@ function inferMask(name: string): string | null {
  * Upsert SimpleFIN data into bank_accounts + transactions. Returns counts.
  * Runs in a single transaction so a partial failure doesn't leave us with
  * half-synced state.
+ *
+ * Duplicate protection follows Actual Budget's matchTransactions
+ * (accounts/sync.ts): match on the bank's transaction ID first; if the ID is
+ * new, look for an existing row in the same account with the same amount
+ * within 7 days whose old ID is no longer in the bank's response (a pending
+ * charge that posted under a new ID, or a bank that re-issued IDs) and update
+ * that row instead of inserting a second copy. Pending holds that vanish from
+ * the response without posting were cancelled, so they're removed.
  */
+const DEDUPE_WINDOW_MS = 7 * 86_400_000;
+
 async function syncSimpleFinData(
   userId: string,
   connectionId: string,
   accounts: SimpleFinAccount[],
-): Promise<{ accounts: number; transactions: number }> {
+  fetchStartSec: number,
+): Promise<{ accounts: number; transactions: number; inserted: number; merged: number; removed_pending: number }> {
   let txnCount = 0;
+  let inserted = 0;
+  let merged = 0;
+  let removedPending = 0;
+  const fetchStart = new Date(fetchStartSec * 1000);
   await withTransaction(async (client) => {
     for (const acct of accounts) {
       const institution = acct.org.name ?? acct.org.domain ?? null;
@@ -123,8 +140,8 @@ async function syncSimpleFinData(
         `INSERT INTO bank_accounts
            (user_id, provider, provider_account_id, institution, name,
             account_type, mask, currency, current_balance, last_synced_at,
-            connection_id)
-         VALUES ($1, 'simplefin', $2, $3, $4, $5, $6, $7, $8, now(), $9)
+            connection_id, on_budget)
+         VALUES ($1, 'simplefin', $2, $3, $4, $5, $6, $7, $8, now(), $9, $10)
          ON CONFLICT (user_id, provider, provider_account_id)
          DO UPDATE SET
            institution = EXCLUDED.institution,
@@ -146,36 +163,100 @@ async function syncSimpleFinData(
           acct.currency || 'USD',
           acct.balance,
           connectionId,
+          !['investment', 'loan'].includes(accountType),
         ],
       );
       const accountRowId = upsert.rows[0]!.id;
 
       const txns = acct.transactions ?? [];
+      const incomingIds = new Set(txns.map((t) => t.id));
+      const existing = await client.query<{
+        id: string;
+        provider_txn_id: string;
+        amount: string;
+        posted_at: Date;
+        pending: boolean;
+      }>(
+        `SELECT id, provider_txn_id, amount::text, posted_at, pending
+         FROM transactions WHERE account_id = $1 AND posted_at >= $2`,
+        [accountRowId, new Date(fetchStart.getTime() - DEDUPE_WINDOW_MS)],
+      );
+      const byProviderId = new Map(existing.rows.map((r) => [r.provider_txn_id, r]));
+      // Only trust "this ID is gone" inside the date range the bank actually
+      // returned — many banks keep ~90 days, and older rows are simply out of
+      // range, not replaced.
+      const returnedFrom = txns.length
+        ? new Date(Math.max(fetchStart.getTime(), Math.min(...txns.map((t) => t.posted * 1000))))
+        : null;
+      // Rows whose bank ID disappeared from this response — merge candidates.
+      const orphans = returnedFrom
+        ? existing.rows.filter(
+            (r) => !incomingIds.has(r.provider_txn_id) && (r.pending || r.posted_at >= returnedFrom),
+          )
+        : [];
+      const claimed = new Set<string>();
+
       for (const tx of txns) {
-        await client.query(
-          `INSERT INTO transactions
-             (account_id, user_id, provider_txn_id, posted_at, amount,
-              currency, description, merchant, pending)
-           VALUES ($1, $2, $3, to_timestamp($4), $5, $6, $7, $8, $9)
-           ON CONFLICT (account_id, provider_txn_id)
-           DO UPDATE SET
-             amount = EXCLUDED.amount,
-             description = EXCLUDED.description,
-             merchant = EXCLUDED.merchant,
-             pending = EXCLUDED.pending`,
-          [
-            accountRowId,
-            userId,
-            tx.id,
-            tx.posted,
-            tx.amount,
-            acct.currency || 'USD',
-            tx.description,
-            tx.payee ?? null,
-            !!tx.pending,
-          ],
-        );
+        const postedMs = tx.posted * 1000;
+        let targetId: string | null = byProviderId.get(tx.id)?.id ?? null;
+        if (!targetId) {
+          const cents = Math.round(Number(tx.amount) * 100);
+          let best: (typeof orphans)[number] | null = null;
+          let bestDist = Infinity;
+          for (const o of orphans) {
+            if (claimed.has(o.id)) continue;
+            if (Math.round(Number(o.amount) * 100) !== cents) continue;
+            const dist = Math.abs(o.posted_at.getTime() - postedMs);
+            if (dist > DEDUPE_WINDOW_MS) continue;
+            // Nearest date wins; on a tie prefer the pending one.
+            if (dist < bestDist || (dist === bestDist && o.pending && !best?.pending)) {
+              best = o;
+              bestDist = dist;
+            }
+          }
+          if (best) {
+            claimed.add(best.id);
+            targetId = best.id;
+            merged += 1;
+          }
+        }
+        if (targetId) {
+          await client.query(
+            `UPDATE transactions SET provider_txn_id = $2, posted_at = to_timestamp($3),
+               amount = $4, description = $5, merchant = $6, pending = $7
+             WHERE id = $1`,
+            [targetId, tx.id, tx.posted, tx.amount, tx.description, tx.payee ?? null, !!tx.pending],
+          );
+        } else {
+          await client.query(
+            `INSERT INTO transactions
+               (account_id, user_id, provider_txn_id, posted_at, amount,
+                currency, description, merchant, pending)
+             VALUES ($1, $2, $3, to_timestamp($4), $5, $6, $7, $8, $9)
+             ON CONFLICT (account_id, provider_txn_id) DO NOTHING`,
+            [
+              accountRowId,
+              userId,
+              tx.id,
+              tx.posted,
+              tx.amount,
+              acct.currency || 'USD',
+              tx.description,
+              tx.payee ?? null,
+              !!tx.pending,
+            ],
+          );
+          inserted += 1;
+        }
         txnCount += 1;
+      }
+
+      // Cancelled holds: pending rows in the fetched window that the bank no
+      // longer reports and that didn't turn into a posted transaction.
+      const gone = orphans.filter((o) => o.pending && !claimed.has(o.id) && o.posted_at >= returnedFrom!);
+      if (gone.length) {
+        await client.query(`DELETE FROM transactions WHERE id = ANY($1::uuid[])`, [gone.map((g) => g.id)]);
+        removedPending += gone.length;
       }
     }
     await client.query(
@@ -185,7 +266,7 @@ async function syncSimpleFinData(
       [connectionId],
     );
   });
-  return { accounts: accounts.length, transactions: txnCount };
+  return { accounts: accounts.length, transactions: txnCount, inserted, merged, removed_pending: removedPending };
 }
 
 /**
@@ -235,8 +316,9 @@ bankingRouter.post('/connect', async (req, res) => {
   const startDate = Math.floor(Date.now() / 1000) - TXN_SYNC_WINDOW_DAYS * 86400;
   let counts;
   try {
-    const data = await fetchSimpleFinAccounts(accessUrl, { start_date: startDate });
-    counts = await syncSimpleFinData(userId, connectionId, data.accounts ?? []);
+    const data = await fetchSimpleFinAccounts(accessUrl, { start_date: startDate, pending: true });
+    counts = await syncSimpleFinData(userId, connectionId, data.accounts ?? [], startDate);
+    counts = { ...counts, processed: await processTransactions(userId) };
   } catch (err) {
     await query(
       `UPDATE simplefin_connections SET status = 'error', last_error = $2 WHERE id = $1`,
@@ -288,9 +370,10 @@ bankingRouter.post('/sync', async (req, res) => {
     : Math.floor(Date.now() / 1000) - TXN_SYNC_WINDOW_DAYS * 86400;
 
   try {
-    const data = await fetchSimpleFinAccounts(accessUrl, { start_date: startDate });
-    const counts = await syncSimpleFinData(userId, row.id, data.accounts ?? []);
-    res.json({ ok: true, ...counts, errors: data.errors ?? [] });
+    const data = await fetchSimpleFinAccounts(accessUrl, { start_date: startDate, pending: true });
+    const counts = await syncSimpleFinData(userId, row.id, data.accounts ?? [], startDate);
+    const processed = await processTransactions(userId, { since: new Date(startDate * 1000) });
+    res.json({ ok: true, ...counts, processed, errors: data.errors ?? [] });
   } catch (err) {
     await query(
       `UPDATE simplefin_connections SET status = 'error', last_error = $2 WHERE id = $1`,
@@ -325,7 +408,7 @@ bankingRouter.get('/accounts', async (req, res) => {
 
   const accounts = await query<BankAccountRow>(
     `SELECT id, provider_account_id, institution, name, account_type, mask,
-            currency, current_balance, last_synced_at
+            currency, current_balance, last_synced_at, on_budget
      FROM bank_accounts
      WHERE user_id = $1 AND provider = 'simplefin'
      ORDER BY institution ASC NULLS LAST, name ASC`,
@@ -366,24 +449,19 @@ bankingRouter.get('/transactions', async (req, res) => {
     filter = ` AND account_id = $${params.length}`;
   }
   params.push(limit);
-  const result = await query<TransactionRow>(
-    `SELECT id, account_id, posted_at, amount, currency, description, merchant,
-            category, pending
-     FROM transactions
-     WHERE user_id = $1 AND posted_at >= $2${filter}
-     ORDER BY posted_at DESC
+  const result = await query(
+    `SELECT ${TXN_SELECT}
+     FROM transactions t
+     JOIN bank_accounts ba ON ba.id = t.account_id
+     LEFT JOIN categories c ON c.id = t.category_id
+     WHERE t.user_id = $1 AND t.posted_at >= $2${filter.replace('account_id', 't.account_id')}
+     ORDER BY t.posted_at DESC
      LIMIT $${params.length}`,
     params,
   );
-  // Tag each row with is_transfer so the client can visually mark
-  // credit-card payments / internal transfers as "not real spend."
-  res.json({
-    transactions: result.rows.map((r) => ({
-      ...r,
-      amount: Number(r.amount),
-      is_transfer: isTransferOrPayment(r.description, r.merchant),
-    })),
-  });
+  // is_transfer / category now come from the transaction engine (stored on
+  // the row), not a per-request regex.
+  res.json({ transactions: result.rows });
 });
 
 /**
@@ -416,7 +494,7 @@ bankingRouter.get('/recurring', async (req, res) => {
   }>(
     `SELECT posted_at, amount, description, merchant, account_id
      FROM transactions
-     WHERE user_id = $1 AND posted_at >= $2 AND amount < 0
+     WHERE user_id = $1 AND posted_at >= $2 AND amount < 0 AND NOT is_transfer
      ORDER BY posted_at ASC`,
     [userId, since],
   );
@@ -432,9 +510,7 @@ bankingRouter.get('/recurring', async (req, res) => {
   }
 
   const candidates = detectRecurring(
-    txns.rows
-      .filter((r) => !isTransferOrPayment(r.description, r.merchant))
-      .map((r) => ({
+    txns.rows.map((r) => ({
       posted_at: r.posted_at,
       amount: Math.abs(Number(r.amount)),
       raw: r.merchant ?? r.description,
@@ -559,6 +635,31 @@ bankingRouter.get('/credit-card-debug', async (req, res) => {
 });
 
 /**
+ * PATCH /api/banking/accounts/:id — keep an account on or off the budget.
+ * Off-budget accounts (brokerage, loans by default) are tracked for net worth
+ * but their transactions don't touch categories or To Budget.
+ */
+bankingRouter.patch('/accounts/:id', async (req, res) => {
+  const parsed = z.object({ on_budget: z.boolean() }).safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Invalid body' });
+    return;
+  }
+  const userId = req.user!.id;
+  const r = await query(`UPDATE bank_accounts SET on_budget = $3 WHERE id = $1 AND user_id = $2`, [
+    req.params.id,
+    userId,
+    parsed.data.on_budget,
+  ]);
+  if (!r.rowCount) {
+    res.status(404).json({ error: 'Account not found' });
+    return;
+  }
+  const processed = await processTransactions(userId, { ai: false });
+  res.json({ ok: true, processed });
+});
+
+/**
  * DELETE /api/banking/connection — revoke the stored connection and all
  * cascaded bank_accounts + transactions.
  */
@@ -573,29 +674,6 @@ bankingRouter.delete('/connection', async (req, res) => {
 });
 
 // ---- Recurring-bill detection helpers ---------------------------------
-
-/**
- * Normalize a merchant/description string so two charges from the same vendor
- * group together regardless of trailing reference numbers, common boilerplate,
- * or weird whitespace. Conservative — we'd rather miss a group than merge
- * unrelated merchants together.
- */
-function normalizeMerchant(raw: string): string {
-  return raw
-    .toUpperCase()
-    .replace(/[#*]/g, ' ')
-    .replace(/\s+/g, ' ')
-    // Strip long numeric / alphanumeric ID tails ("ABC12345", "#12345").
-    .replace(/\b[A-Z0-9]*\d{4,}[A-Z0-9]*\b/g, ' ')
-    // Strip generic transaction boilerplate.
-    .replace(
-      /\b(BILL\s*PAYMENT|BILL\s*PAY|RECURRING|ONLINE|PAYMENT|PURCHASE|DEBIT|ACH|WEB|POS|CARD|TRANSACTION|REF|INV)\b/g,
-      ' ',
-    )
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 40);
-}
 
 type Cadence = 'weekly' | 'biweekly' | 'monthly' | 'quarterly' | 'annual' | 'custom';
 
