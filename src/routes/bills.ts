@@ -84,6 +84,12 @@ interface BillWithSummary extends Omit<BillRow, 'amount'> {
   monthly_equivalent: number;
   last_paid_at: string | null;
   total_paid: number;
+  /** Most recent synced charge filed under this bill's category. */
+  last_charge_amount: number | null;
+  last_charge_date: string | null;
+  /** True when that charge differs from the bill amount (rent + utilities,
+   *  a price increase, ...) so the app can offer to update the bill. */
+  amount_changed: boolean;
 }
 
 const MONTHS_PER_YEAR = 12;
@@ -121,6 +127,17 @@ async function loadBills(userId: string): Promise<BillWithSummary[]> {
     [billsResult.rows.map((b) => b.id)],
   );
 
+  // Latest real charge per bill (via the bill's linked budget category).
+  const charges = await query<{ bill_id: string; amount: string; posted_at: string }>(
+    `SELECT DISTINCT ON (b.id) b.id AS bill_id, (-t.amount)::text AS amount, t.posted_at::date::text AS posted_at
+     FROM bills b
+     JOIN transactions t ON t.category_id = b.category_id AND t.user_id = b.user_id
+     WHERE b.id = ANY($1::uuid[]) AND t.amount < 0 AND NOT t.pending
+     ORDER BY b.id, t.posted_at DESC`,
+    [billsResult.rows.map((b) => b.id)],
+  );
+  const chargeByBill = new Map(charges.rows.map((c) => [c.bill_id, c]));
+
   const paymentsByBill = new Map<string, BillPaymentRow[]>();
   for (const p of paymentsResult.rows) {
     const arr = paymentsByBill.get(p.bill_id) ?? [];
@@ -137,6 +154,11 @@ async function loadBills(userId: string): Promise<BillWithSummary[]> {
       monthly_equivalent: monthlyEquivalent(amount, b.cadence),
       last_paid_at: payments[0]?.paid_at ?? null,
       total_paid: payments.reduce((acc, p) => acc + Number(p.amount), 0),
+      last_charge_amount: chargeByBill.has(b.id) ? Number(chargeByBill.get(b.id)!.amount) : null,
+      last_charge_date: chargeByBill.get(b.id)?.posted_at ?? null,
+      amount_changed: chargeByBill.has(b.id)
+        ? Math.abs(Number(chargeByBill.get(b.id)!.amount) - amount) > Math.max(1, amount * 0.03)
+        : false,
     };
   });
 }
