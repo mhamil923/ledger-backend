@@ -149,12 +149,15 @@ SELECT DISTINCT user_id, 'Savings', 'Savings', 1000
 FROM budgets WHERE savings_target > 0
 ON CONFLICT (user_id, (lower(name))) DO NOTHING;
 
+-- If an old variable category was already named "Savings", its limit and the
+-- savings target are both money set aside, so they're added together.
 INSERT INTO category_budgets (category_id, month, budgeted)
 SELECT c.id, b.month, b.savings_target
 FROM budgets b
 JOIN categories c ON c.user_id = b.user_id AND lower(c.name) = 'savings'
 WHERE b.savings_target > 0
-ON CONFLICT (category_id, month) DO NOTHING;
+ON CONFLICT (category_id, month)
+DO UPDATE SET budgeted = category_budgets.budgeted + EXCLUDED.budgeted;
 
 -- 6. Every active bill gets its own category in the Bills group, a rule that
 --    routes its charges there, and a monthly budget equal to its monthly
@@ -177,18 +180,23 @@ FROM bills
 WHERE active = true AND category_id IS NOT NULL
   AND length(trim(COALESCE(NULLIF(trim(merchant), ''), name))) > 3;
 
+-- Bills that share a name (or match an existing category) share one
+-- envelope, so their monthly amounts are summed, then added to anything the
+-- category already had budgeted.
 INSERT INTO category_budgets (category_id, month, budgeted)
 SELECT bl.category_id, b.month,
-       ROUND(bl.amount * CASE bl.cadence
+       SUM(ROUND(bl.amount * CASE bl.cadence
          WHEN 'weekly' THEN 52.0 / 12
          WHEN 'biweekly' THEN 26.0 / 12
          WHEN 'quarterly' THEN 1.0 / 3
          WHEN 'annual' THEN 1.0 / 12
-         ELSE 1 END, 2)
+         ELSE 1 END, 2))
 FROM bills bl
 JOIN budgets b ON b.user_id = bl.user_id
 WHERE bl.active = true AND bl.category_id IS NOT NULL
-ON CONFLICT (category_id, month) DO NOTHING;
+GROUP BY bl.category_id, b.month
+ON CONFLICT (category_id, month)
+DO UPDATE SET budgeted = category_budgets.budgeted + EXCLUDED.budgeted;
 
 -- 7. The budget starts in the earliest month that has anything budgeted.
 INSERT INTO budget_settings (user_id, start_month)

@@ -138,7 +138,7 @@ categoriesRouter.patch('/:id', async (req, res) => {
       return;
     }
     const processed =
-      match_patterns || fields.hidden != null ? await processTransactions(userId, { ai: false }) : null;
+      match_patterns ? await processTransactions(userId, { ai: false }) : null;
     res.json({ category: updated, processed });
   } catch (err) {
     if ((err as { code?: string }).code === '23505') {

@@ -185,8 +185,7 @@ export async function loadRules(userId: string, client?: pg.PoolClient): Promise
     `SELECT r.id, r.stage, r.field, r.op, r.value, r.amount_min, r.amount_max,
             r.account_id, r.category_id, r.set_transfer, r.source
      FROM category_rules r
-     LEFT JOIN categories c ON c.id = r.category_id
-     WHERE r.user_id = $1 AND (r.category_id IS NULL OR c.hidden = false)`,
+     WHERE r.user_id = $1`,
     [userId],
   );
   return sortRules(res.rows);
@@ -270,9 +269,12 @@ export async function processTransactions(
       if (claimed.has(b.id) || b.account_id === a.account_id) continue;
       const dist = Math.abs(b.posted_at.getTime() - a.posted_at.getTime());
       if (dist > PAIR_WINDOW_MS) continue;
+      // Same amount + opposite sign isn't enough on its own (a card refund
+      // can coincide with an unrelated purchase), so one side has to read
+      // like a transfer or card payment.
       const plausible =
-        b.account_type === 'credit_card' ||
-        b.account_type === 'loan' ||
+        ((b.account_type === 'credit_card' || b.account_type === 'loan') &&
+          isCardPaymentInflow(b.description, b.merchant)) ||
         looksLikeTransfer(a.description, a.merchant) ||
         looksLikeTransfer(b.description, b.merchant) ||
         isTransferOrPayment(a.description, a.merchant);
@@ -309,6 +311,11 @@ export async function processTransactions(
       if (match.set_transfer != null) {
         transfer = match.set_transfer;
         source = 'rule';
+      } else if (match.category_id) {
+        // A category rule wins over transfer wording for one-sided entries:
+        // "Online transfer to Fidelity" leaves the budget, so it must land in
+        // a category (e.g. Investing), not vanish as a transfer.
+        transfer = false;
       } else if (
         (amount < 0 && isTransferOrPayment(t.description, t.merchant)) ||
         (amount > 0 && t.account_type === 'credit_card' && isCardPaymentInflow(t.description, t.merchant)) ||

@@ -24,7 +24,8 @@ export interface SimpleFinOrg {
 
 export interface SimpleFinTransaction {
   id: string;
-  posted: number; // unix seconds
+  posted: number; // unix seconds; 0 for pending transactions
+  transacted_at?: number; // unix seconds, when the purchase happened
   amount: string;
   description: string;
   payee?: string;

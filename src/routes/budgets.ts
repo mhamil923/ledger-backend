@@ -179,11 +179,19 @@ budgetsRouter.post('/:month/fund-bills', async (req, res) => {
      WHERE user_id = $1 AND active = true AND category_id IS NOT NULL`,
     [userId],
   );
+  // Several bills can share one category, so sum per category first.
+  const perCategory = new Map<string, number>();
   for (const b of bills.rows) {
+    perCategory.set(
+      b.category_id,
+      (perCategory.get(b.category_id) ?? 0) + billMonthlyEquivalent(Number(b.amount), b.cadence),
+    );
+  }
+  for (const [categoryId, amount] of perCategory) {
     await pool.query(
       `INSERT INTO category_budgets (category_id, month, budgeted) VALUES ($1, $2, $3)
        ON CONFLICT (category_id, month) DO UPDATE SET budgeted = EXCLUDED.budgeted, updated_at = now()`,
-      [b.category_id, m.data, billMonthlyEquivalent(Number(b.amount), b.cadence)],
+      [categoryId, m.data, Math.round(amount * 100) / 100],
     );
   }
   res.json({ funded: bills.rows.length, ...(await computeEnvelope(userId, m.data)) });

@@ -2,7 +2,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { pool, withTransaction } from '../db.js';
-import { config } from '../config.js';
 import { requireAuth } from '../auth/middleware.js';
 import { processTransactions } from '../services/transaction-engine.js';
 import { normalizeMerchant } from '../services/transactions-classify.js';
@@ -42,7 +41,7 @@ transactionsRouter.get('/', async (req, res) => {
     where.push(sql.replace('?', `$${params.length}`));
   };
   if (q.month) {
-    params.push(config.BUDGET_TZ);
+    params.push('UTC'); // same month rule as the budget (see envelope.ts)
     add(`to_char(t.posted_at AT TIME ZONE $${params.length}, 'YYYY-MM') = ?`, q.month);
   } else if (q.days) {
     add('t.posted_at >= ?', new Date(Date.now() - q.days * 86_400_000));
@@ -116,6 +115,15 @@ transactionsRouter.patch('/:id', async (req, res) => {
            category_source = CASE WHEN $2 THEN NULL ELSE category_source END
          WHERE id = ANY($1::uuid[]) AND user_id = $3`,
         [ids, d.is_transfer, userId],
+      );
+    }
+    if (d.category_id && txn.transfer_txn_id) {
+      // Giving one half of a transfer pair a category means it isn't a
+      // transfer — release the other half too so it counts normally.
+      await client.query(
+        `UPDATE transactions SET is_transfer = false, transfer_source = 'manual', transfer_txn_id = NULL
+         WHERE id = $1 AND user_id = $2`,
+        [txn.transfer_txn_id, userId],
       );
     }
     if (d.category_id !== undefined) {

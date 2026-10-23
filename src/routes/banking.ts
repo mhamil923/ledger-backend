@@ -168,7 +168,13 @@ async function syncSimpleFinData(
       );
       const accountRowId = upsert.rows[0]!.id;
 
-      const txns = acct.transactions ?? [];
+      // SimpleFIN reports pending transactions with posted = 0; fall back to
+      // transacted_at (what Actual does), then to now.
+      const nowSec = Math.floor(Date.now() / 1000);
+      const txns = (acct.transactions ?? []).map((t) => ({
+        ...t,
+        posted: t.posted > 0 ? t.posted : t.transacted_at && t.transacted_at > 0 ? t.transacted_at : nowSec,
+      }));
       const incomingIds = new Set(txns.map((t) => t.id));
       const existing = await client.query<{
         id: string;
@@ -178,8 +184,10 @@ async function syncSimpleFinData(
         pending: boolean;
       }>(
         `SELECT id, provider_txn_id, amount::text, posted_at, pending
-         FROM transactions WHERE account_id = $1 AND posted_at >= $2`,
-        [accountRowId, new Date(fetchStart.getTime() - DEDUPE_WINDOW_MS)],
+         FROM transactions
+         WHERE account_id = $1
+           AND (posted_at >= $2 OR pending OR provider_txn_id = ANY($3::text[]))`,
+        [accountRowId, new Date(fetchStart.getTime() - DEDUPE_WINDOW_MS), [...incomingIds]],
       );
       const byProviderId = new Map(existing.rows.map((r) => [r.provider_txn_id, r]));
       // Only trust "this ID is gone" inside the date range the bank actually

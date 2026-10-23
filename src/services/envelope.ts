@@ -213,7 +213,11 @@ const GROUP_ORDER = (name: string): number =>
 export async function computeEnvelope(userId: string, month: string): Promise<EnvelopeMonth> {
   const settings = await getSettings(userId);
   const start = settings.start_month;
-  const tz = config.BUDGET_TZ;
+  // Banks (via SimpleFIN) date transactions at midnight UTC of the posting
+  // day, so a transaction's month comes from its UTC date — converting to
+  // local time would push the 1st of the month into the previous month.
+  // (Actual does the same.) BUDGET_TZ only decides what "this month" is.
+  const tz = 'UTC';
 
   const [catsRes, budgetsRes, activityRes, looseRes, billsRes, patternsRes] = await Promise.all([
     pool.query<{

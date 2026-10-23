@@ -129,6 +129,8 @@ const CARD_INFLOW_PATTERNS = [
   /\bmobile payment\b/i,
   /\bepayment\b/i,
   /\bpayment\s*-?\s*(web|ach|online|mobile)\b/i,
+  /^\s*(payment|pymt|pmt)\b/i,
+  /\b(pymt|pmt)\b/i,
 ];
 
 export function isCardPaymentInflow(description: string | null | undefined, merchant: string | null | undefined): boolean {
