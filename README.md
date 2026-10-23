@@ -1,6 +1,6 @@
 # ledger-backend
 
-Express + Postgres backend for Ledger. Provides auth, watchlist, market data quotes (Finnhub + CoinGecko), and AI analysis (Anthropic). Layers 2–6 have schemas and stub routes; real implementations land as each layer is built.
+Express + Postgres backend for Ledger. Provides auth, watchlist, market data quotes (Finnhub + CoinGecko), AI analysis (Anthropic), SimpleFIN banking, and envelope budgeting modeled on Actual Budget. See [BUDGETING.md](BUDGETING.md) for how the budget works and how to roll out migration 014.
 
 ## Prerequisites
 
