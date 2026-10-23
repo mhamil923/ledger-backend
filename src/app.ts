@@ -30,7 +30,7 @@ export function createApp(): express.Express {
       credentials: true,
     }),
   );
-  app.use(express.json({ limit: '1mb' }));
+  app.use(express.json({ limit: '10mb' })); // Apple Card CSV imports
 
   app.use('/health', healthRouter);
   app.use('/api/auth', authRouter);

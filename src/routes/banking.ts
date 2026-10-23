@@ -15,6 +15,7 @@ import {
 import { normalizeMerchant } from '../services/transactions-classify.js';
 import { processTransactions } from '../services/transaction-engine.js';
 import { TXN_SELECT } from './transactions.js';
+import { parseAppleCardCsv } from '../services/apple-card-import.js';
 
 export const bankingRouter = Router();
 bankingRouter.use(requireAuth);
@@ -42,6 +43,9 @@ interface BankAccountRow {
   currency: string;
   current_balance: string | null;
   last_synced_at: Date | null;
+  on_budget?: boolean;
+  balance_as_of?: Date | null;
+  provider?: string;
 }
 
 interface TransactionRow {
@@ -140,8 +144,9 @@ async function syncSimpleFinData(
         `INSERT INTO bank_accounts
            (user_id, provider, provider_account_id, institution, name,
             account_type, mask, currency, current_balance, last_synced_at,
-            connection_id, on_budget)
-         VALUES ($1, 'simplefin', $2, $3, $4, $5, $6, $7, $8, now(), $9, $10)
+            connection_id, on_budget, balance_as_of)
+         VALUES ($1, 'simplefin', $2, $3, $4, $5, $6, $7, $8, now(), $9, $10,
+                 CASE WHEN $11::bigint > 0 THEN to_timestamp($11::bigint) END)
          ON CONFLICT (user_id, provider, provider_account_id)
          DO UPDATE SET
            institution = EXCLUDED.institution,
@@ -151,7 +156,8 @@ async function syncSimpleFinData(
            currency = EXCLUDED.currency,
            current_balance = EXCLUDED.current_balance,
            last_synced_at = EXCLUDED.last_synced_at,
-           connection_id = EXCLUDED.connection_id
+           connection_id = EXCLUDED.connection_id,
+           balance_as_of = COALESCE(EXCLUDED.balance_as_of, bank_accounts.balance_as_of)
          RETURNING id`,
         [
           userId,
@@ -164,6 +170,7 @@ async function syncSimpleFinData(
           acct.balance,
           connectionId,
           !['investment', 'loan'].includes(accountType),
+          Number(acct['balance-date']) || 0,
         ],
       );
       const accountRowId = upsert.rows[0]!.id;
@@ -416,9 +423,9 @@ bankingRouter.get('/accounts', async (req, res) => {
 
   const accounts = await query<BankAccountRow>(
     `SELECT id, provider_account_id, institution, name, account_type, mask,
-            currency, current_balance, last_synced_at, on_budget
+            currency, current_balance, last_synced_at, on_budget, balance_as_of, provider
      FROM bank_accounts
-     WHERE user_id = $1 AND provider = 'simplefin'
+     WHERE user_id = $1
      ORDER BY institution ASC NULLS LAST, name ASC`,
     [userId],
   );
@@ -639,6 +646,105 @@ bankingRouter.get('/credit-card-debug', async (req, res) => {
       amount: Number(r.amount),
       posted_at: r.posted_at.toISOString().slice(0, 10),
     })),
+  });
+});
+
+/**
+ * POST /api/banking/import/apple-card — import an Apple Card CSV export.
+ * Creates (once) an "Apple Card" credit-card account and upserts every row.
+ * Re-importing overlapping date ranges is safe. Payments from checking to
+ * Apple Card then pair up as transfers like your other cards.
+ */
+const appleImportSchema = z.object({
+  csv: z.string().min(20).max(8_000_000),
+  /** Current balance owed, as shown in Wallet (positive number). */
+  balance_owed: z.number().nonnegative().optional(),
+});
+bankingRouter.post('/import/apple-card', async (req, res) => {
+  const parsed = appleImportSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Send the exported CSV file contents.', issues: parsed.error.issues });
+    return;
+  }
+  const userId = req.user!.id;
+  let rows;
+  let skipped = 0;
+  try {
+    ({ rows, skipped } = parseAppleCardCsv(parsed.data.csv));
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : 'Could not read that file.' });
+    return;
+  }
+  if (rows.length === 0) {
+    res.status(400).json({ error: 'No transactions found in that file.' });
+    return;
+  }
+
+  let inserted = 0;
+  let updated = 0;
+  const accountId = await withTransaction(async (client) => {
+    const acct = await client.query<{ id: string }>(
+      `INSERT INTO bank_accounts
+         (user_id, provider, provider_account_id, institution, name, account_type,
+          currency, current_balance, last_synced_at, on_budget, balance_as_of)
+       VALUES ($1, 'apple_card', 'apple-card', 'Apple Card (Goldman Sachs)', 'Apple Card', 'credit_card',
+               'USD', $2, now(), true, CASE WHEN $2::numeric IS NOT NULL THEN now() END)
+       ON CONFLICT (user_id, provider, provider_account_id)
+       DO UPDATE SET last_synced_at = now(),
+         current_balance = COALESCE($2, bank_accounts.current_balance),
+         balance_as_of = CASE WHEN $2::numeric IS NOT NULL THEN now() ELSE bank_accounts.balance_as_of END
+       RETURNING id`,
+      [userId, parsed.data.balance_owed != null ? -parsed.data.balance_owed : null],
+    );
+    const id = acct.rows[0]!.id;
+    for (const r of rows) {
+      const result = await client.query<{ inserted: boolean }>(
+        `INSERT INTO transactions
+           (account_id, user_id, provider_txn_id, posted_at, amount, currency,
+            description, merchant, category, pending)
+         VALUES ($1, $2, $3, $4, $5, 'USD', $6, $7, $8, $9)
+         ON CONFLICT (account_id, provider_txn_id) DO UPDATE SET
+           posted_at = EXCLUDED.posted_at, amount = EXCLUDED.amount,
+           description = EXCLUDED.description, merchant = EXCLUDED.merchant,
+           category = EXCLUDED.category, pending = EXCLUDED.pending
+         RETURNING (xmax = 0) AS inserted`,
+        [id, userId, r.id, r.posted, r.amount, r.description, r.merchant, r.appleCategory, r.pending],
+      );
+      if (result.rows[0]?.inserted) inserted++;
+      else updated++;
+    }
+    // Apple Card is now a real account, so paying it from checking is a
+    // transfer again — retire the "count the payment as spending" rules.
+    await client.query(
+      `DELETE FROM category_rules WHERE user_id = $1 AND lower(value) IN ('applecard gsbank', 'applecard')`,
+      [userId],
+    );
+    await client.query(
+      `UPDATE categories SET hidden = true
+       WHERE user_id = $1 AND name = 'Apple Card (unlinked)'`,
+      [userId],
+    );
+    return id;
+  });
+
+  const processed = await processTransactions(userId);
+  const range = rows.reduce(
+    (acc, r) => ({
+      from: !acc.from || r.posted < acc.from ? r.posted : acc.from,
+      to: !acc.to || r.posted > acc.to ? r.posted : acc.to,
+    }),
+    { from: null as Date | null, to: null as Date | null },
+  );
+  res.json({
+    ok: true,
+    account_id: accountId,
+    rows: rows.length,
+    inserted,
+    updated,
+    skipped,
+    from: range.from?.toISOString().slice(0, 10),
+    to: range.to?.toISOString().slice(0, 10),
+    processed,
   });
 });
 

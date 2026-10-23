@@ -58,8 +58,13 @@ interface TxnRow {
   transfer_source: 'paired' | 'pattern' | 'rule' | 'manual' | null;
   transfer_txn_id: string | null;
   ai_category: string | null;
+  /** Category supplied by the bank/export itself (e.g. Apple Card's "Grocery"). */
+  category: string | null;
   account_type: string;
   on_budget: boolean;
+  account_name: string;
+  institution: string | null;
+  mask: string | null;
 }
 
 interface TxnState {
@@ -191,6 +196,66 @@ export async function loadRules(userId: string, client?: pg.PoolClient): Promise
   return sortRules(res.rows);
 }
 
+/**
+ * Banks/exports that label transactions themselves (Apple Card: "Grocery",
+ * "Restaurants", ...) are used as a fallback when no rule matches, mapped to
+ * your categories by name.
+ */
+const PROVIDER_CATEGORY_NAMES: Record<string, string[]> = {
+  grocery: ['Groceries'],
+  restaurants: ['Dining Out', 'Restaurants', 'Dining'],
+  gas: ['Gas'],
+  shopping: ['Shopping'],
+  entertainment: ['Entertainment'],
+  transportation: ['Auto & parking', 'Transportation'],
+  utilities: ['Rent + utilities', 'Utilities'],
+};
+
+async function loadProviderCategoryMap(userId: string): Promise<Map<string, string>> {
+  const cats = await pool.query<{ id: string; name: string }>(
+    `SELECT id, name FROM categories WHERE user_id = $1 AND NOT is_income`,
+    [userId],
+  );
+  const byName = new Map(cats.rows.map((c) => [c.name.toLowerCase(), c.id]));
+  const out = new Map<string, string>();
+  for (const [provider, names] of Object.entries(PROVIDER_CATEGORY_NAMES)) {
+    const hit = names.map((n) => byName.get(n.toLowerCase())).find(Boolean);
+    if (hit) out.set(provider, hit);
+  }
+  return out;
+}
+
+/**
+ * Card issuers a payment description can name. If an outflow names one
+ * ("APPLECARD GSBANK PAYMENT", "Payment to Chase card ending in 5219"), it may
+ * only pair with an account from that issuer (and that last-4, if given).
+ */
+const ISSUERS: Array<{ key: string; words: RegExp }> = [
+  { key: 'apple', words: /\bapple ?card\b|\bgsbank\b/i },
+  { key: 'amex', words: /\bamerican express\b|\bamex\b/i },
+  { key: 'chase', words: /\bchase\b/i },
+  { key: 'discover', words: /\bdiscover\b/i },
+  { key: 'capitalone', words: /\bcapital one\b/i },
+  { key: 'citi', words: /\bciti(bank)?\b/i },
+  { key: 'target', words: /\btarget card\b/i },
+  { key: 'boa', words: /\bbank of america\b/i },
+];
+
+function issuersIn(text: string): Set<string> {
+  return new Set(ISSUERS.filter((i) => i.words.test(text)).map((i) => i.key));
+}
+
+/** Does outflow `a` (a payment) plausibly go to account `b`? */
+function namesCompatibleAccount(a: TxnRow, b: TxnRow): boolean {
+  const text = `${a.description} ${a.merchant ?? ''}`;
+  const named = issuersIn(text);
+  if (named.size === 0) return true; // doesn't name anyone — can't rule it out
+  const target = issuersIn(`${b.institution ?? ''} ${b.account_name}`);
+  if (![...named].some((k) => target.has(k))) return false;
+  const last4 = text.match(/ending in (\d{4})/i)?.[1];
+  return !last4 || !b.mask || b.mask === last4 || b.account_name.includes(last4);
+}
+
 // ---------------------------------------------------------------------------
 // Main pipeline
 // ---------------------------------------------------------------------------
@@ -213,8 +278,8 @@ export async function processTransactions(
   const res = await pool.query<TxnRow>(
     `SELECT t.id, t.account_id, t.amount::text, t.description, t.merchant, t.posted_at,
             t.pending, t.category_id, t.category_source, t.is_transfer,
-            t.transfer_source, t.transfer_txn_id, t.ai_category,
-            ba.account_type, ba.on_budget
+            t.transfer_source, t.transfer_txn_id, t.ai_category, t.category,
+            ba.account_type, ba.on_budget, ba.name AS account_name, ba.institution, ba.mask
      FROM transactions t
      JOIN bank_accounts ba ON ba.id = t.account_id
      WHERE t.user_id = $1 ${since ? 'AND t.posted_at >= $2' : ''}
@@ -223,6 +288,7 @@ export async function processTransactions(
   );
   const txns = res.rows;
   const rules = await loadRules(userId);
+  const providerMap = await loadProviderCategoryMap(userId);
 
   const state = new Map<string, TxnState>();
   for (const t of txns) {
@@ -267,6 +333,7 @@ export async function processTransactions(
     let bestDist = Infinity;
     for (const b of candidates) {
       if (claimed.has(b.id) || b.account_id === a.account_id) continue;
+      if (!namesCompatibleAccount(a, b)) continue;
       const dist = Math.abs(b.posted_at.getTime() - a.posted_at.getTime());
       if (dist > PAIR_WINDOW_MS) continue;
       // Same amount + opposite sign isn't enough on its own (a card refund
@@ -336,8 +403,9 @@ export async function processTransactions(
       s.category_source = null;
       continue;
     }
-    if (match.category_id) {
-      s.category_id = match.category_id;
+    const fromProvider = !match.category_id && t.category ? providerMap.get(t.category.toLowerCase()) : undefined;
+    if (match.category_id || fromProvider) {
+      s.category_id = (match.category_id ?? fromProvider)!;
       s.category_source = 'rule';
       result.categorized_by_rule += 1;
     } else if (s.category_source === 'rule') {
