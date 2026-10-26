@@ -34,6 +34,9 @@ const RANGE_TO_SPEC: Record<string, RangeSpec> = {
   '30d': { interval: '1day', outputsize: 22 },
   '90d': { interval: '1day', outputsize: 65 },
   '1y': { interval: '1day', outputsize: 252 },
+  // Quant engine (analysis): enough history to backtest setups.
+  quant_daily: { interval: '1day', outputsize: 600 },
+  quant_hourly: { interval: '1h', outputsize: 700 },
 };
 
 interface TimeSeriesResponse {

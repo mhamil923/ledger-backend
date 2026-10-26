@@ -28,6 +28,16 @@ import {
   type SymbolActivity,
 } from '../services/trade-journal.js';
 
+import { getQuantCandles } from '../services/market-data.js';
+import {
+  convictionFromStats,
+  formatQuantForPrompt,
+  runQuant,
+  type Candidate,
+  type QuantReport,
+} from '../services/quant.js';
+import { getNextEarnings } from '../services/finnhub.js';
+
 export const analysisRouter = Router();
 
 const requestSchema = z.object({
@@ -67,6 +77,17 @@ export interface TradeIdea {
    * - waiting: setup not yet valid; watching for trigger
    */
   entry_kind?: EntryKind;
+  /** Quant setup this idea is built from (see services/quant.ts). */
+  setup_id?: string;
+  /** Measured on this asset's own history. Absent = not backtested. */
+  backtest?: {
+    label: string;
+    n: number;
+    win_rate: number;
+    win_rate_lower: number;
+    avg_r: number;
+    t2_rate: number;
+  } | null;
 }
 
 export interface TradeIdeasByHorizon {
@@ -113,6 +134,26 @@ export interface AnalysisData {
   position_sizing?: string;
   indicators?: IndicatorSnapshot;
   sentiment?: MarketSentiment | null;
+  /** Quant engine summary shown in the app (regime, levels, setup backtests). */
+  quant?: QuantSummary | null;
+}
+
+export interface QuantSummary {
+  regime: { daily: string | null; hourly: string | null };
+  atr_pct_daily: number | null;
+  support: number[];
+  resistance: number[];
+  next_earnings: string | null;
+  backtests: Array<{
+    horizon: string;
+    setup_id: string;
+    label: string;
+    direction: string;
+    n: number;
+    win_rate: number;
+    win_rate_lower: number;
+    avg_r: number;
+  }>;
 }
 
 interface CachedRow {
@@ -152,6 +193,11 @@ const tradeIdeaSchema = {
       minimum: 1,
       maximum: 5,
       description: '1 = no edge, 5 = strong confluence FOR THIS HORIZON.',
+    },
+    setup_id: {
+      type: 'string',
+      description:
+        'For intraday / short_term / medium_term: the setup_id of a CANDIDATE FIRING NOW for this horizon that you are building this idea from, or "none". The server replaces entry/stop/targets with that candidate\'s measured plan. long_term: "none".',
     },
   },
   required: [
@@ -398,6 +444,9 @@ function sanitizeTradeIdea(raw: unknown): TradeIdea | null {
     targets,
     rationale: typeof r.rationale === 'string' ? r.rationale : '',
     conviction,
+    setup_id: typeof r.setup_id === 'string' ? r.setup_id : undefined,
+    backtest:
+      r.backtest && typeof r.backtest === 'object' ? (r.backtest as TradeIdea['backtest']) : undefined,
   };
 }
 
@@ -509,6 +558,7 @@ function sanitizeAnalysisData(raw: AnalysisData | null): AnalysisData | null {
     position_sizing:
       typeof raw.position_sizing === 'string' ? raw.position_sizing : undefined,
     indicators: raw.indicators,
+    quant: raw.quant ?? null,
     sentiment: raw.sentiment,
   };
 }
@@ -548,7 +598,16 @@ CRITICAL — use your journal:
 - If your overall expectancy is NEGATIVE, be MUCH more willing to use conviction=1 waiting trades. A pass is worth more than a bad committed trade.
 - Reference the journal in summary_markdown ("my recent long trades in this RSI regime have a 30% win rate — sizing down / using waiting entry" is far more useful than "I feel bullish").
 
-Always call submit_analysis exactly once with primary_horizon set to whichever idea has the strongest setup right now.`;
+Always call submit_analysis exactly once with primary_horizon set to whichever idea has the strongest setup right now.
+
+QUANT ENGINE RULES (they override anything above when they conflict):
+- The QUANT ENGINE block is computed from real candles and each setup's hit rate was measured by replaying THIS asset's own history. Treat its numbers as facts.
+- intraday / short_term / medium_term: build each idea from a CANDIDATE FIRING NOW for that same horizon and put its setup_id in the idea. Prefer the candidate with the best measured avg R and a conservative win rate ≥ 50%. The server will overwrite entry/stop/targets with that candidate's plan, so explain the setup, don't invent new levels.
+- If no candidate is firing for a horizon (or every candidate has avg R ≤ 0), set setup_id "none", entry_kind "waiting", conviction 1, and describe exactly what would need to happen (e.g. "pullback to EMA20 at X while ADX stays above 20").
+- Quote the measured odds in the rationale ("this setup hit target 1 in 14 of 22 past trades on this chart, avg +0.31R"). Never claim certainty; a 65% setup still loses 1 in 3.
+- Use the computed support/resistance (touch counts) for key_levels instead of round numbers.
+- long_term: setup_id "none"; accumulation framing as before; conviction at most 3 (not backtested).
+- Stocks: if NEXT EARNINGS falls inside a horizon's holding window, say so in that idea and keep conviction ≤ 2.`;
 
 const DEEP_SYSTEM_PROMPT = `You are running in DEEP DIVE mode for an experienced retail trader. The user paid premium Opus tokens — match that expectation with substantially more thorough analysis.
 
@@ -638,7 +697,16 @@ DEGENERATE RESPONSES (will be rejected and retried):
 - ANY trade_ideas slot set to null
 - ANY trade_ideas slot missing required fields (direction, entry_zone, stop_loss, targets, rationale, conviction)
 
-Call submit_analysis exactly once. Do not return plain text — the UI only renders tool output.`;
+Call submit_analysis exactly once. Do not return plain text — the UI only renders tool output.
+
+QUANT ENGINE RULES (they override anything above when they conflict):
+- The QUANT ENGINE block is computed from real candles and each setup's hit rate was measured by replaying THIS asset's own history. Treat its numbers as facts.
+- intraday / short_term / medium_term: build each idea from a CANDIDATE FIRING NOW for that same horizon and put its setup_id in the idea. Prefer the candidate with the best measured avg R and a conservative win rate ≥ 50%. The server will overwrite entry/stop/targets with that candidate's plan, so explain the setup, don't invent new levels.
+- If no candidate is firing for a horizon (or every candidate has avg R ≤ 0), set setup_id "none", entry_kind "waiting", conviction 1, and describe exactly what would need to happen (e.g. "pullback to EMA20 at X while ADX stays above 20").
+- Quote the measured odds in the rationale ("this setup hit target 1 in 14 of 22 past trades on this chart, avg +0.31R"). Never claim certainty; a 65% setup still loses 1 in 3.
+- Use the computed support/resistance (touch counts) for key_levels instead of round numbers.
+- long_term: setup_id "none"; accumulation framing as before; conviction at most 3 (not backtested).
+- Stocks: if NEXT EARNINGS falls inside a horizon's holding window, say so in that idea and keep conviction ≤ 2.`;
 
 /**
  * Compute risk/reward ratio (target1 vs stop) from an entry midpoint.
@@ -700,7 +768,9 @@ function applyQualityGates(
     // Gate 1: R:R < 1.5 → force waiting. This is math, not a risk signal —
     // the trade is negative-expectancy no matter what. Non-negotiable.
     const rr = computeRR(idea);
-    if (rr != null && rr < 1.5) {
+    // Measured setups are judged on their actual average result, not R:R.
+    const measured = !!idea.backtest && idea.backtest.n >= 8 && idea.backtest.avg_r > 0;
+    if (!measured && rr != null && rr < 1.5) {
       notes.push(
         `${h}: R:R was ${rr.toFixed(2)} (<1.5) — forced to waiting. The math on this trade doesn't work.`,
       );
@@ -749,6 +819,127 @@ function applyQualityGates(
   }
 
   return { ideas: out, notes };
+}
+
+
+const HORIZON_DAYS: Record<keyof TradeIdeasByHorizon, number> = {
+  intraday: 1,
+  short_term: 14,
+  medium_term: 120,
+  long_term: 365,
+};
+
+/**
+ * Replace each idea's numbers with the quant candidate it names, set
+ * conviction from the measured stats (Claude can only lower it), and turn
+ * anything without a measured edge into a "waiting" idea.
+ */
+export function groundInQuant(
+  ideas: TradeIdeasByHorizon,
+  quant: QuantReport,
+  earnings: { date: string } | null,
+): { ideas: TradeIdeasByHorizon; notes: string[]; primary: keyof TradeIdeasByHorizon | null } {
+  const notes: string[] = [];
+  const out: TradeIdeasByHorizon = { ...ideas };
+  const pct = (x: number): string => `${Math.round(x * 100)}%`;
+  const earningsInDays = earnings
+    ? (Date.parse(earnings.date + 'T12:00:00Z') - Date.now()) / 86_400_000
+    : null;
+
+  for (const h of ['intraday', 'short_term', 'medium_term'] as const) {
+    const idea = out[h];
+    const pool = quant.candidates.filter((c) => c.horizon === h && c.stats.avg_r > 0 && c.stats.n >= 8);
+    let cand: Candidate | undefined = idea?.setup_id
+      ? quant.candidates.find((c) => c.horizon === h && c.setup_id === idea.setup_id)
+      : undefined;
+    if (cand && !(cand.stats.avg_r > 0 && cand.stats.n >= 8)) {
+      notes.push(`${h}: ${cand.label} is firing but has no measured edge here (n=${cand.stats.n}, avg ${cand.stats.avg_r.toFixed(2)}R) — not taking it.`);
+      cand = undefined;
+    }
+    if (!cand && pool.length > 0 && idea && idea.setup_id && idea.setup_id !== 'none') cand = pool[0];
+    if (!cand && idea?.setup_id === 'none' && pool[0] && convictionFromStats(pool[0].stats) >= 4) {
+      notes.push(
+        `${h}: Claude passed on ${pool[0].label}, which measured ${Math.round(pool[0].stats.win_rate * 100)}% over ${pool[0].stats.n} past setups — its reasoning is in this horizon's rationale.`,
+      );
+    }
+    if (!cand) {
+      if (idea) {
+        out[h] = {
+          ...idea,
+          entry_kind: 'waiting',
+          conviction: 1,
+          setup_id: 'none',
+          backtest: null,
+          rationale: `[No measured setup is firing for this timeframe — watch only.] ${idea.rationale}`,
+        };
+      }
+      continue;
+    }
+    let conviction = Math.min(idea?.conviction ?? 5, convictionFromStats(cand.stats));
+    if (earningsInDays != null && earningsInDays >= 0 && earningsInDays <= HORIZON_DAYS[h] && conviction > 2) {
+      notes.push(`${h}: earnings on ${earnings!.date} fall inside this trade's window — conviction capped at 2.`);
+      conviction = 2;
+    }
+    out[h] = {
+      direction: cand.direction,
+      entry_zone: cand.entry_zone,
+      entry_kind: cand.entry_kind,
+      stop_loss: cand.stop_loss,
+      targets: cand.targets,
+      conviction,
+      setup_id: cand.setup_id,
+      backtest: {
+        label: cand.label,
+        n: cand.stats.n,
+        win_rate: cand.stats.win_rate,
+        win_rate_lower: cand.stats.win_rate_lower,
+        avg_r: cand.stats.avg_r,
+        t2_rate: cand.stats.t2_rate,
+      },
+      rationale:
+        `[${cand.label}: hit target 1 in ${cand.stats.wins}/${cand.stats.n} past setups on this chart (${pct(cand.stats.win_rate)}, ` +
+        `conservatively ${pct(cand.stats.win_rate_lower)}), avg ${cand.stats.avg_r >= 0 ? '+' : ''}${cand.stats.avg_r.toFixed(2)}R. ${cand.why}.] ` +
+        (idea?.rationale ?? ''),
+    };
+  }
+
+  const lt = out.long_term;
+  if (lt && lt.conviction > 3) out.long_term = { ...lt, conviction: 3, backtest: null };
+
+  // Primary = the measured idea with the best conservative odds.
+  let primary: keyof TradeIdeasByHorizon | null = null;
+  let best = -1;
+  for (const h of ['intraday', 'short_term', 'medium_term'] as const) {
+    const bt = out[h]?.backtest;
+    if (bt && out[h]!.entry_kind !== 'waiting' && bt.win_rate_lower > best) {
+      best = bt.win_rate_lower;
+      primary = h;
+    }
+  }
+  return { ideas: out, notes, primary };
+}
+
+export function summarizeQuant(q: QuantReport, earnings: { date: string } | null): QuantSummary {
+  const lv = (q.daily ?? q.hourly);
+  return {
+    regime: { daily: q.daily?.indicators.regime ?? null, hourly: q.hourly?.indicators.regime ?? null },
+    atr_pct_daily: q.daily?.indicators.atr_pct ?? null,
+    support: lv?.support.map((l) => l.price) ?? [],
+    resistance: lv?.resistance.map((l) => l.price) ?? [],
+    next_earnings: earnings?.date ?? null,
+    backtests: q.backtests
+      .filter((b) => b.stats.n > 0)
+      .map((b) => ({
+        horizon: b.horizon,
+        setup_id: b.setup_id,
+        label: b.label,
+        direction: b.direction,
+        n: b.stats.n,
+        win_rate: b.stats.win_rate,
+        win_rate_lower: b.stats.win_rate_lower,
+        avg_r: b.stats.avg_r,
+      })),
+  };
 }
 
 analysisRouter.post('/', requireAuth, async (req, res) => {
@@ -862,6 +1053,29 @@ analysisRouter.post('/', requireAuth, async (req, res) => {
     } catch {
       // Fall back to the basic spot quote if upstream is rate-limited.
     }
+  }
+
+  // Quant engine: daily + hourly candles → regime, levels, backtested setups.
+  // Stocks previously got no price history at all; this fixes that too.
+  let quant: QuantReport | null = null;
+  let earnings: { date: string; hour: string | null } | null = null;
+  try {
+    const candles = await getQuantCandles(symbol, asset_type);
+    if (candles) {
+      quant = runQuant(candles);
+      if (!indicators && candles.daily.length > 0) {
+        indicators = indicatorSnapshot(candles.daily.map((c) => ({ ts: c.ts, price: c.close })));
+      }
+    }
+  } catch (err) {
+    console.warn(`quant engine failed for ${symbol} (non-fatal):`, err);
+  }
+  if (asset_type !== 'crypto') {
+    earnings = await getNextEarnings(symbol);
+  }
+  if (quant) contextBlock += '\n\n' + formatQuantForPrompt(quant);
+  if (earnings) {
+    contextBlock += `\nNEXT EARNINGS: ${earnings.date}${earnings.hour ? ` (${earnings.hour === 'bmo' ? 'before open' : earnings.hour === 'amc' ? 'after close' : earnings.hour})` : ''}`;
   }
 
   // Build the track record block — Claude's recent ideas + outcomes so it can
@@ -1080,6 +1294,25 @@ analysisRouter.post('/', requireAuth, async (req, res) => {
     return;
   }
 
+  // Ground the trade ideas in the quant engine: numbers come from the
+  // measured candidate, conviction from its measured stats.
+  if (quant) {
+    const grounded = groundInQuant(analysisData.trade_ideas, quant, earnings);
+    analysisData = {
+      ...analysisData,
+      trade_ideas: grounded.ideas,
+      primary_horizon: grounded.primary ?? analysisData.primary_horizon,
+      time_horizon: grounded.primary ?? analysisData.time_horizon,
+      quant: summarizeQuant(quant, earnings),
+    };
+    if (grounded.notes.length) {
+      analysisData.summary_markdown =
+        (analysisData.summary_markdown ?? '') +
+        '\n\n---\n_Measured-setup check:_\n' +
+        grounded.notes.map((n) => `- ${n}`).join('\n');
+    }
+  }
+
   // Apply server-side quality gates. Claude's prompt tells it to follow these
   // rules but empirically it doesn't — repeat-loss patterns and low-R:R trades
   // still leak through. The gates rewrite bad ideas to waiting/conviction=1
@@ -1124,6 +1357,10 @@ analysisRouter.post('/', requireAuth, async (req, res) => {
         macd_state_at_creation: indicators?.macd_state ?? null,
         fear_greed_at_creation: sentiment?.fear_greed_index ?? null,
         model,
+        setup_id: primaryIdea.setup_id ?? null,
+        bt_win_rate: primaryIdea.backtest?.win_rate ?? null,
+        bt_n: primaryIdea.backtest?.n ?? null,
+        bt_avg_r: primaryIdea.backtest?.avg_r ?? null,
       });
     } catch (err) {
       console.warn('recordTradeIdea failed (non-fatal):', err);

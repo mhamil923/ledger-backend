@@ -292,6 +292,12 @@ export async function processTransactions(
 
   const state = new Map<string, TxnState>();
   for (const t of txns) {
+    // A pair whose other half was deleted (account removed, re-import) is no
+    // longer a pair — let it be evaluated again from scratch.
+    if (t.transfer_source === 'paired' && !t.transfer_txn_id) {
+      t.is_transfer = false;
+      t.transfer_source = null;
+    }
     state.set(t.id, {
       category_id: t.category_id,
       category_source: t.category_source,

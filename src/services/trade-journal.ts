@@ -64,6 +64,10 @@ export interface RecordIdeaInput {
   macd_state_at_creation?: string | null;
   fear_greed_at_creation?: number | null;
   model: string;
+  setup_id?: string | null;
+  bt_win_rate?: number | null;
+  bt_n?: number | null;
+  bt_avg_r?: number | null;
 }
 
 /**
@@ -89,13 +93,13 @@ export async function recordTradeIdea(input: RecordIdeaInput): Promise<string | 
        direction, entry_low, entry_high, stop_loss, targets,
        bias, conviction, time_horizon, rationale,
        price_at_creation, rsi14_at_creation, macd_state_at_creation,
-       fear_greed_at_creation, model
+       fear_greed_at_creation, model, setup_id, bt_win_rate, bt_n, bt_avg_r
      )
      VALUES (
        $1, $2, $3, $4, $5,
        $6, $7, $8, $9, $10,
        $11, $12, $13, $14,
-       $15, $16, $17, $18, $19
+       $15, $16, $17, $18, $19, $20, $21, $22, $23
      )
      RETURNING id`,
     [
@@ -118,6 +122,10 @@ export async function recordTradeIdea(input: RecordIdeaInput): Promise<string | 
       input.macd_state_at_creation ?? null,
       input.fear_greed_at_creation ?? null,
       input.model,
+      input.setup_id ?? null,
+      input.bt_win_rate ?? null,
+      input.bt_n ?? null,
+      input.bt_avg_r ?? null,
     ],
   );
   return result.rows[0]?.id ?? null;

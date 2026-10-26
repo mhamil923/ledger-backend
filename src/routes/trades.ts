@@ -1,3 +1,4 @@
+import { query } from '../db.js';
 import { Router } from 'express';
 import { z } from 'zod';
 import { requireAuth } from '../auth/middleware.js';
@@ -49,5 +50,29 @@ tradesRouter.get('/summary', async (req, res) => {
     /* non-fatal */
   }
   const tr = await getTrackRecord(userId, { daysBack: 60, limit: 50 });
-  res.json(tr);
+  // Honest scorecard: quant-grounded ideas (setup_id set) vs the older
+  // eyeballed ones, and what the backtests predicted vs what actually happened.
+  const score = await query<{ kind: string; n: string; wins: string; predicted: string | null; avg_pnl: string | null }>(
+    `SELECT CASE WHEN setup_id IS NOT NULL AND setup_id <> 'none' THEN 'measured' ELSE 'legacy' END AS kind,
+            COUNT(*)::text AS n,
+            COUNT(*) FILTER (WHERE resolution LIKE 'target%')::text AS wins,
+            AVG(bt_win_rate)::text AS predicted,
+            AVG(realized_pnl_pct)::text AS avg_pnl
+     FROM trade_ideas
+     WHERE user_id = $1 AND status = 'closed'
+     GROUP BY 1`,
+    [userId],
+  );
+  const scorecard: Record<string, { closed: number; wins: number; win_rate: number; predicted_win_rate: number | null; avg_pnl_pct: number | null }> = {};
+  for (const r of score.rows) {
+    const n = Number(r.n);
+    scorecard[r.kind] = {
+      closed: n,
+      wins: Number(r.wins),
+      win_rate: n ? Number(r.wins) / n : 0,
+      predicted_win_rate: r.predicted != null ? Number(r.predicted) : null,
+      avg_pnl_pct: r.avg_pnl != null ? Number(r.avg_pnl) : null,
+    };
+  }
+  res.json({ ...tr, scorecard });
 });

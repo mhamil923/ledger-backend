@@ -52,3 +52,29 @@ export async function getStockQuote(symbol: string): Promise<StockQuote> {
     ts: data.t * 1000,
   };
 }
+
+/**
+ * Next scheduled earnings report within `days` (Finnhub earnings calendar).
+ * Holding a swing trade through earnings turns it into a coin flip on the
+ * report, so the analysis flags and caps those trades.
+ */
+export async function getNextEarnings(
+  symbol: string,
+  days = 45,
+): Promise<{ date: string; hour: string | null } | null> {
+  if (!config.FINNHUB_API_KEY) return null;
+  const from = new Date().toISOString().slice(0, 10);
+  const to = new Date(Date.now() + days * 86_400_000).toISOString().slice(0, 10);
+  const url = `${FINNHUB_BASE}/calendar/earnings?from=${from}&to=${to}&symbol=${encodeURIComponent(symbol)}&token=${config.FINNHUB_API_KEY}`;
+  try {
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const data = (await res.json()) as { earningsCalendar?: Array<{ date: string; hour?: string; symbol: string }> };
+    const next = (data.earningsCalendar ?? [])
+      .filter((e) => e.symbol?.toUpperCase() === symbol.toUpperCase() && e.date >= from)
+      .sort((a, b) => a.date.localeCompare(b.date))[0];
+    return next ? { date: next.date, hour: next.hour || null } : null;
+  } catch {
+    return null;
+  }
+}
