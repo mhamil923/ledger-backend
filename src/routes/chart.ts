@@ -9,6 +9,7 @@ import {
   type TwelveDataCandle,
 } from '../services/twelvedata.js';
 import { rsi, simpleMovingAverage } from '../services/indicators.js';
+import { getHistory, type ChartInterval } from '../services/chart-history.js';
 
 export const chartRouter = Router();
 chartRouter.use(requireAuth);
@@ -177,6 +178,36 @@ function twelveDataToChartResponse(
     source: 'twelvedata',
   };
 }
+
+/**
+ * GET /api/chart/history?symbol&asset_type&interval=5m|15m|1h|4h|1d|1w&before=<ms>&limit=
+ * One page of OHLCV candles ending just before `before` (or now). The app
+ * calls it again with the oldest loaded timestamp as you scroll/zoom back.
+ */
+const historySchema = z.object({
+  symbol: z.string().min(1).max(20),
+  asset_type: z.enum(['stock', 'crypto', 'etf']),
+  interval: z.enum(['5m', '15m', '1h', '4h', '1d', '1w']).optional().default('1d'),
+  before: z.coerce.number().int().positive().optional(),
+  limit: z.coerce.number().int().min(20).max(1000).optional().default(300),
+});
+chartRouter.get('/history', async (req, res) => {
+  const parsed = historySchema.safeParse(req.query);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Invalid query', issues: parsed.error.issues });
+    return;
+  }
+  const { symbol, asset_type, interval, before, limit } = parsed.data;
+  try {
+    const page = await getHistory(symbol, asset_type, interval as ChartInterval, before ?? null, limit);
+    res.json({ symbol, asset_type, interval, ...page });
+  } catch (err) {
+    res.status(502).json({
+      error: 'Could not load chart history',
+      detail: err instanceof Error ? err.message : String(err),
+    });
+  }
+});
 
 chartRouter.get('/', async (req, res) => {
   const parsed = querySchema.safeParse(req.query);
