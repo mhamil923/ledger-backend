@@ -19,6 +19,7 @@ import { categoriesRouter } from './routes/categories.js';
 import { rulesRouter } from './routes/rules.js';
 import { transactionsRouter } from './routes/transactions.js';
 import { overviewRouter } from './routes/overview.js';
+import { marketsRouter } from './routes/markets.js';
 
 export function createApp(): express.Express {
   const app = express();
@@ -49,6 +50,7 @@ export function createApp(): express.Express {
   app.use('/api/rules', rulesRouter);
   app.use('/api/transactions', transactionsRouter);
   app.use('/api/overview', overviewRouter);
+  app.use('/api/markets', marketsRouter);
   app.use('/api/execute', executeRouter);
 
   app.use((_req: Request, res: Response) => {

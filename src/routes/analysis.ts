@@ -37,6 +37,7 @@ import {
   type QuantReport,
 } from '../services/quant.js';
 import { getNextEarnings } from '../services/finnhub.js';
+import { formatEventsForPrompt, getEventRisk, type MarketEvent } from '../services/market-calendar.js';
 
 export const analysisRouter = Router();
 
@@ -88,6 +89,8 @@ export interface TradeIdea {
     avg_r: number;
     t2_rate: number;
   } | null;
+  /** A scheduled market-moving event inside this trade's entry/holding window. */
+  event_risk?: string | null;
 }
 
 export interface TradeIdeasByHorizon {
@@ -447,6 +450,7 @@ function sanitizeTradeIdea(raw: unknown): TradeIdea | null {
     setup_id: typeof r.setup_id === 'string' ? r.setup_id : undefined,
     backtest:
       r.backtest && typeof r.backtest === 'object' ? (r.backtest as TradeIdea['backtest']) : undefined,
+    event_risk: typeof r.event_risk === 'string' ? r.event_risk : null,
   };
 }
 
@@ -834,6 +838,48 @@ const HORIZON_DAYS: Record<keyof TradeIdeasByHorizon, number> = {
  * conviction from the measured stats (Claude can only lower it), and turn
  * anything without a measured edge into a "waiting" idea.
  */
+/**
+ * Scheduled events (Fed, CPI/jobs/PCE, quad witching, crypto expiry, big-cap
+ * earnings) can gap price straight through a stop. They don't change whether
+ * a setup is good, but they change WHEN to enter:
+ *   day trade   — a high-impact release in the next 24h caps conviction at 2
+ *   swing       — one in the next 48h caps conviction at 3 ("enter after it")
+ *   position    — no cap; the next Fed decision is noted for awareness
+ */
+export function applyEventRisk(
+  ideas: TradeIdeasByHorizon,
+  events: MarketEvent[],
+): { ideas: TradeIdeasByHorizon; notes: string[] } {
+  const notes: string[] = [];
+  const out: TradeIdeasByHorizon = { ...ideas };
+  const now = Date.now();
+  const within = (h: number): MarketEvent[] =>
+    events.filter((e) => e.category !== 'earnings' || e.impact === 'high').filter((e) => Date.parse(e.at) - now <= h * 3_600_000);
+  const fmt = (e: MarketEvent): string => {
+    const hrs = (Date.parse(e.at) - now) / 3_600_000;
+    return `${e.title} ${hrs < 24 ? `in ${Math.max(1, Math.round(hrs))}h` : `in ${(hrs / 24).toFixed(1)} days`}`;
+  };
+  const rules: Array<[keyof TradeIdeasByHorizon, number, number | null]> = [
+    ['intraday', 24, 2],
+    ['short_term', 48, 3],
+  ];
+  for (const [h, hours, cap] of rules) {
+    const idea = out[h];
+    const hit = within(hours);
+    if (!idea || hit.length === 0) continue;
+    const label = hit.slice(0, 2).map(fmt).join('; ');
+    let conviction = idea.conviction;
+    if (cap != null && idea.entry_kind !== 'waiting' && conviction > cap) {
+      notes.push(`${h}: ${label} — conviction capped at ${cap}. Safer to enter after the release.`);
+      conviction = cap;
+    }
+    out[h] = { ...idea, conviction, event_risk: label };
+  }
+  const fed = events.find((e) => /^fomc-\d/.test(e.id)) ?? events.find((e) => e.category === 'fed' && e.impact === 'high');
+  if (out.medium_term && fed) out.medium_term = { ...out.medium_term, event_risk: `Next ${fmt(fed)}` };
+  return { ideas: out, notes };
+}
+
 export function groundInQuant(
   ideas: TradeIdeasByHorizon,
   quant: QuantReport,
@@ -1073,7 +1119,14 @@ analysisRouter.post('/', requireAuth, async (req, res) => {
   if (asset_type !== 'crypto') {
     earnings = await getNextEarnings(symbol);
   }
+  let eventRisk: MarketEvent[] = [];
+  try {
+    eventRisk = await getEventRisk(userId, symbol, asset_type, 30);
+  } catch (err) {
+    console.warn('event calendar failed (non-fatal):', err);
+  }
   if (quant) contextBlock += '\n\n' + formatQuantForPrompt(quant);
+  contextBlock += '\n\n' + formatEventsForPrompt(eventRisk);
   if (earnings) {
     contextBlock += `\nNEXT EARNINGS: ${earnings.date}${earnings.hour ? ` (${earnings.hour === 'bmo' ? 'before open' : earnings.hour === 'amc' ? 'after close' : earnings.hour})` : ''}`;
   }
@@ -1310,6 +1363,16 @@ analysisRouter.post('/', requireAuth, async (req, res) => {
         (analysisData.summary_markdown ?? '') +
         '\n\n---\n_Measured-setup check:_\n' +
         grounded.notes.map((n) => `- ${n}`).join('\n');
+    }
+  }
+
+  // Scheduled market-moving events inside each trade's window.
+  if (eventRisk.length) {
+    const ev = applyEventRisk(analysisData.trade_ideas, eventRisk);
+    analysisData = { ...analysisData, trade_ideas: ev.ideas };
+    if (ev.notes.length) {
+      analysisData.summary_markdown =
+        (analysisData.summary_markdown ?? '') + '\n\n---\n_Event risk:_\n' + ev.notes.map((n) => `- ${n}`).join('\n');
     }
   }
 
