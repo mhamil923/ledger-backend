@@ -12,7 +12,8 @@
     "create-user": "tsx scripts/create-user.ts",
     "change-password": "tsx scripts/change-password.ts",
     "typecheck": "tsc --noEmit",
-    "backtest": "tsx scripts/backtest.ts"
+    "backtest": "tsx scripts/backtest.ts",
+    "breakeven": "tsx scripts/breakeven.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",

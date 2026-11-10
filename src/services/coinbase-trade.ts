@@ -49,7 +49,7 @@ function buildJwt(method: string, path: string): string {
   });
 }
 
-async function coinbaseFetch<T>(method: string, path: string, body?: unknown): Promise<T> {
+export async function coinbaseFetch<T>(method: string, path: string, body?: unknown): Promise<T> {
   const token = buildJwt(method, path);
   const res = await fetch(`${BASE}${path}`, {
     method,
