@@ -6,6 +6,8 @@ import { getMarketNews } from '../services/market-news.js';
 import { generateBrief, latestBrief } from '../services/market-brief.js';
 import { getCryptoFearGreed } from '../services/sentiment.js';
 import { isAnthropicConfigured } from '../services/anthropic.js';
+import { getCryptoPlan } from '../services/breakeven.js';
+import { config } from '../config.js';
 
 export const marketsRouter = Router();
 marketsRouter.use(requireAuth);
@@ -54,5 +56,22 @@ marketsRouter.post('/brief', wrap(async (req, res) => {
     res.json({ brief: await p });
   } catch (err) {
     res.status(502).json({ error: 'Brief failed', detail: err instanceof Error ? err.message : String(err) });
+  }
+}));
+
+// Crypto break-even + DCA plan (Portfolio → Break-even & DCA).
+marketsRouter.get('/crypto-plan', wrap(async (req, res) => {
+  if (!config.COINBASE_API_KEY_NAME || !config.COINBASE_API_PRIVATE_KEY) {
+    res.status(503).json({ error: 'Connect Coinbase first — add COINBASE_API_KEY_NAME and COINBASE_API_PRIVATE_KEY to the backend .env.' });
+    return;
+  }
+  const budget = Number(req.query.budget);
+  const only = typeof req.query.symbols === 'string' && req.query.symbols ? req.query.symbols.toUpperCase().split(',') : undefined;
+  try {
+    const plan = await getCryptoPlan({ budget: Number.isFinite(budget) && budget > 0 ? budget : null, refresh: req.query.refresh === '1', only });
+    res.json(plan);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(502).json({ error: msg.includes('401') ? 'Coinbase rejected the API key — it needs "View" permission.' : `Coinbase: ${msg}` });
   }
 }));
