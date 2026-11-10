@@ -169,6 +169,9 @@ export interface EnvelopeCategory {
     amount: number;
     next_due_date: string | null;
     monthly_equivalent: number;
+    /** Fraction someone else pays back (0.5 = split rent). */
+    shared_share: number;
+    shared_with: string | null;
   } | null;
   match_patterns: string[];
 }
@@ -263,8 +266,8 @@ export async function computeEnvelope(userId: string, month: string): Promise<En
        GROUP BY 1`,
       [userId, start, month, tz],
     ),
-    pool.query<{ id: string; category_id: string; cadence: string; amount: string; next_due_date: string | null }>(
-      `SELECT id, category_id, cadence, amount::text, next_due_date::text
+    pool.query<{ id: string; category_id: string; cadence: string; amount: string; next_due_date: string | null; shared_share: string; shared_with: string | null }>(
+      `SELECT id, category_id, cadence, amount::text, next_due_date::text, shared_share::text, shared_with
        FROM bills WHERE user_id = $1 AND active = true AND category_id IS NOT NULL`,
       [userId],
     ),
@@ -372,6 +375,8 @@ export async function computeEnvelope(userId: string, month: string): Promise<En
             amount: Number(bill.amount),
             next_due_date: bill.next_due_date,
             monthly_equivalent: billMonthlyEquivalent(Number(bill.amount), bill.cadence),
+            shared_share: Number(bill.shared_share) || 0,
+            shared_with: bill.shared_with,
           }
         : null,
       match_patterns: patternsByCat.get(c.id) ?? [],

@@ -174,8 +174,8 @@ budgetsRouter.post('/:month/fund-bills', async (req, res) => {
     return;
   }
   const userId = req.user!.id;
-  const bills = await pool.query<{ category_id: string; amount: string; cadence: string }>(
-    `SELECT category_id, amount::text, cadence FROM bills
+  const bills = await pool.query<{ category_id: string; amount: string; cadence: string; shared_share: string }>(
+    `SELECT category_id, amount::text, cadence, shared_share::text FROM bills
      WHERE user_id = $1 AND active = true AND category_id IS NOT NULL`,
     [userId],
   );
@@ -184,7 +184,9 @@ budgetsRouter.post('/:month/fund-bills', async (req, res) => {
   for (const b of bills.rows) {
     perCategory.set(
       b.category_id,
-      (perCategory.get(b.category_id) ?? 0) + billMonthlyEquivalent(Number(b.amount), b.cadence),
+      // Shared bills: plan only your part (the other person pays the rest back).
+      (perCategory.get(b.category_id) ?? 0) +
+        billMonthlyEquivalent(Number(b.amount), b.cadence) * (1 - (Number(b.shared_share) || 0)),
     );
   }
   for (const [categoryId, amount] of perCategory) {

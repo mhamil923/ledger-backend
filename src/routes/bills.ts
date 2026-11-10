@@ -77,7 +77,7 @@ interface BillPaymentRow {
 }
 
 const SELECT_COLS =
-  'id, name, merchant, amount::text, currency, cadence, next_due_date::text, account_id, auto_detected, active, created_at::text, updated_at::text';
+  'id, name, merchant, amount::text, currency, cadence, next_due_date::text, account_id, auto_detected, active, created_at::text, updated_at::text, shared_share::float8 AS shared_share, shared_with';
 
 interface BillWithSummary extends Omit<BillRow, 'amount'> {
   amount: number;
@@ -229,6 +229,9 @@ const patchSchema = z.object({
   cadence: cadenceEnum.optional(),
   next_due_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).nullable().optional(),
   active: z.boolean().optional(),
+  /** Fraction someone else pays you back (0.5 = split in half). */
+  shared_share: z.coerce.number().min(0).max(0.95).optional(),
+  shared_with: z.string().max(100).nullable().optional(),
 });
 
 billsRouter.patch('/:id', async (req, res) => {

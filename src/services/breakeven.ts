@@ -59,6 +59,10 @@ export const DUST_USD = 5;
 /** DCA only into coins with at least this much in them. */
 const DCA_MIN_USD = 20;
 
+function dcaEligible(p: { dust: boolean; status: string; net: number; value: number }): boolean {
+  return !p.dust && p.status !== 'exited' && (p.net > DCA_MIN_USD || p.value > DCA_MIN_USD);
+}
+
 export interface Position {
   code: string;
   qty: number;
@@ -71,7 +75,8 @@ export interface Position {
   pl_pct: number | null;
   breakeven: number;
   rise_needed: number;
-  status: 'house_money' | 'above' | 'below';
+  /** exited = you hold almost none of it anymore (sold or sent away). */
+  status: 'house_money' | 'above' | 'below' | 'exited';
   fees: number;
   dust: boolean;
   add_scenarios: Array<{ add: number; breakeven: number; needs: number }>;
@@ -214,7 +219,8 @@ function analyse(code: string, qty: number, p: number, txs: V2Tx[], fees: { buy:
   const breakeven = qty > 0 ? net / qty : 0;
   const pl = value - net;
   const rise = breakeven > 0 ? breakeven / p - 1 : 0;
-  const status: Position['status'] = net <= 0 ? 'house_money' : pl >= 0 ? 'above' : 'below';
+  const exited = value < DUST_USD && net >= DUST_USD;
+  const status: Position['status'] = exited ? 'exited' : net <= 0 ? 'house_money' : pl >= 0 ? 'above' : 'below';
 
   const add_scenarios = status === 'below'
     ? [100, 250, 500, 1000, 2500].map((add) => {
@@ -230,6 +236,7 @@ function analyse(code: string, qty: number, p: number, txs: V2Tx[], fees: { buy:
   if (freeQty > 0) notes.push(`${fmtQty(freeQty)} ${code} came from rewards/staking (counted as free).`);
   if (extInQty > 0) notes.push(`${fmtQty(extInQty)} ${code} arrived from outside Coinbase, counted at its ${fmtUsd(extInUsd)} value on arrival.`);
   if (extOutQty > 0) notes.push(`${fmtQty(extOutQty)} ${code} was sent off Coinbase — if you still own it elsewhere, your real break-even is lower.`);
+  if (exited) notes.unshift(`You hold almost no ${code} now — the ${fmtUsd(net)} gap is money lost on coins you sold${extOutQty > 0 ? ' or sent to another wallet' : ''}. Break-even doesn't apply.`);
   if (Math.abs(q - qty) > Math.max(1e-6, qty * 0.01)) notes.push(`History adds up to ${fmtQty(q)} but your balance is ${fmtQty(qty)} — some history may be missing.`);
   if (unknown.size) notes.push(`Counted as buys/sells: ${[...unknown].join(', ')}.`);
 
@@ -363,7 +370,7 @@ function simulate(p: Position, weekly: number, weeks: number, endMove: number): 
 }
 
 export async function buildDca(positions: Position[], monthly: number, source: DcaPlan['budget_source'], only?: string[]): Promise<DcaPlan | null> {
-  let coins = positions.filter((p) => p.net > DCA_MIN_USD || p.value > DCA_MIN_USD);
+  let coins = positions.filter(dcaEligible);
   if (only?.length) coins = coins.filter((p) => only.includes(p.code));
   if (!coins.length || !(monthly > 0)) return null;
   const mood = await fearGreed();
@@ -416,7 +423,7 @@ export async function getCryptoPlan(opts: { budget?: number | null; refresh?: bo
     positions: shown,
     totals: { net, value, pl: value - net, pl_pct: net > 0 ? (value - net) / net : null },
     investing_envelope: env,
-    dca_eligible: positions.filter((p) => p.net > DCA_MIN_USD || p.value > DCA_MIN_USD).map((p) => p.code),
+    dca_eligible: positions.filter(dcaEligible).map((p) => p.code),
     dca,
   };
 }

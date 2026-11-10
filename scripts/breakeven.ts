@@ -62,6 +62,7 @@ async function main(): Promise<void> {
     say(`  Up / down      ${usd(r.pl)}  (${r.pl_pct != null ? pct(r.pl_pct) : 'n/a'})`);
     if (r.status === 'house_money') say(`  ✅ Playing with house money — you've taken out more than you put in.`);
     else if (r.status === 'above') say(`  ✅ Above break-even (${price(r.breakeven)}).`);
+    else if (r.status === 'exited') say(`  Mostly sold — realized loss of about ${usd(r.net - r.value)}.`);
     else {
       say(`  Break-even     ${price(r.breakeven)}  → needs ${pct(r.rise_needed)} from here`);
       for (const s of r.add_scenarios) say(`     add ${usd(s.add).padEnd(10)} → break-even ${price(s.breakeven).padEnd(11)} (needs ${pct(s.needs)})`);
