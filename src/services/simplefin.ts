@@ -13,7 +13,9 @@
 // Docs: https://www.simplefin.org/protocol.html
 
 const SETUP_TOKEN_TIMEOUT_MS = 15_000;
-const FETCH_TIMEOUT_MS = 30_000;
+// SimpleFIN fetches live from each bank on every request; with a slow bank
+// that regularly takes over a minute.
+const FETCH_TIMEOUT_MS = 120_000;
 
 export interface SimpleFinOrg {
   domain?: string;
@@ -124,6 +126,8 @@ function parseAccessUrl(accessUrl: string): AccessUrlParts {
  * Fetch the user's bank accounts (and optionally transactions since a date)
  * from SimpleFIN. start_date / end_date are unix seconds.
  */
+export class SimpleFinTimeoutError extends Error {}
+
 export async function fetchSimpleFinAccounts(
   accessUrl: string,
   options: { start_date?: number; end_date?: number; pending?: boolean } = {},
@@ -145,6 +149,11 @@ export async function fetchSimpleFinAccounts(
       signal: controller.signal,
     });
   } catch (err) {
+    if (controller.signal.aborted) {
+      throw new SimpleFinTimeoutError(
+        `SimpleFIN didn't answer within ${FETCH_TIMEOUT_MS / 1000}s — one of your banks is responding slowly. Try again in a few minutes.`,
+      );
+    }
     throw new Error(
       `SimpleFIN /accounts request failed: ${err instanceof Error ? err.message : String(err)}`,
     );

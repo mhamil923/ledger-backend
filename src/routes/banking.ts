@@ -4,6 +4,7 @@ import { query, withTransaction } from '../db.js';
 import { requireAuth } from '../auth/middleware.js';
 import {
   fetchSimpleFinAccounts,
+  SimpleFinTimeoutError,
   redeemSetupToken,
   type SimpleFinAccount,
 } from '../services/simplefin.js';
@@ -385,9 +386,18 @@ bankingRouter.post('/sync', async (req, res) => {
     : Math.floor(Date.now() / 1000) - TXN_SYNC_WINDOW_DAYS * 86400;
 
   try {
-    const data = await fetchSimpleFinAccounts(accessUrl, { start_date: startDate, pending: true });
-    const counts = await syncSimpleFinData(userId, row.id, data.accounts ?? [], startDate);
-    const processed = await processTransactions(userId, { since: new Date(startDate * 1000) });
+    let since = startDate;
+    let data;
+    try {
+      data = await fetchSimpleFinAccounts(accessUrl, { start_date: since, pending: true });
+    } catch (err) {
+      if (!(err instanceof SimpleFinTimeoutError)) throw err;
+      // Slow bank: retry once asking for less (last 14 days, no pending).
+      since = Math.max(startDate, Math.floor(Date.now() / 1000) - 14 * 86400);
+      data = await fetchSimpleFinAccounts(accessUrl, { start_date: since, pending: false });
+    }
+    const counts = await syncSimpleFinData(userId, row.id, data.accounts ?? [], since);
+    const processed = await processTransactions(userId, { since: new Date(since * 1000) });
     res.json({ ok: true, ...counts, processed, errors: data.errors ?? [] });
   } catch (err) {
     await query(
