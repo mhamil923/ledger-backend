@@ -1165,7 +1165,7 @@ analysisRouter.post('/', requireAuth, async (req, res) => {
       model,
       // Bumped because the response now contains FOUR trade ideas plus shared
       // analysis. ~2x the old budget; still ~75% cheaper than 4 separate calls.
-      max_tokens: isDeep ? 10_000 : 3500,
+      max_tokens: isDeep ? 16_000 : 8000,
       system: isDeep ? DEEP_SYSTEM_PROMPT : SYSTEM_PROMPT,
       tools: [isDeep ? DEEP_ANALYSIS_TOOL : ANALYSIS_TOOL],
       tool_choice: { type: 'tool', name: 'submit_analysis' },
@@ -1231,7 +1231,7 @@ analysisRouter.post('/', requireAuth, async (req, res) => {
             : 'Second attempt was still degenerate. ONE MORE TRY. Be concrete. Copy the watching-trade example from the system prompt verbatim, substituting real numbers (SMA20=0.2110 from the data, etc.). Every field must contain real content.';
         const retryMessage = await client.messages.create({
           model,
-          max_tokens: 10_000,
+          max_tokens: 16_000,
           system: DEEP_SYSTEM_PROMPT,
           tools: [DEEP_ANALYSIS_TOOL],
           tool_choice: { type: 'tool', name: 'submit_analysis' },
@@ -1294,7 +1294,7 @@ analysisRouter.post('/', requireAuth, async (req, res) => {
         const fallbackModel = resolveModel('fast');
         const fallbackMsg = await client.messages.create({
           model: fallbackModel,
-          max_tokens: 3500,
+          max_tokens: 8000,
           system: SYSTEM_PROMPT,
           tools: [ANALYSIS_TOOL],
           tool_choice: { type: 'tool', name: 'submit_analysis' },

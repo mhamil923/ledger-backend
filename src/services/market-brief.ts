@@ -268,7 +268,7 @@ export async function generateBrief(userId: string, tier: ModelTier = 'fast'): P
   let inTok = 0, outTok = 0;
   const allBlocks: unknown[] = [];
   for (let turn = 0; turn < 4; turn++) {
-    msg = await client.messages.create({ model, max_tokens: 6000, system: SYSTEM, tools, messages });
+    msg = await client.messages.create({ model, max_tokens: 10000, system: SYSTEM, tools, messages });
     inTok += msg.usage.input_tokens;
     outTok += msg.usage.output_tokens;
     allBlocks.push(...msg.content);
@@ -278,7 +278,7 @@ export async function generateBrief(userId: string, tier: ModelTier = 'fast'): P
     if ((msg.stop_reason as string) === 'pause_turn' && turn < 2) continue; // long web-search turn; let it resume
     messages.push({ role: 'user', content: 'Now call submit_brief with the finished brief.' });
     msg = await client.messages.create({
-      model, max_tokens: 6000, system: SYSTEM, tools, messages,
+      model, max_tokens: 10000, system: SYSTEM, tools, messages,
       tool_choice: { type: 'tool', name: 'submit_brief' },
     });
     inTok += msg.usage.input_tokens;
