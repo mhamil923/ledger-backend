@@ -613,7 +613,7 @@ QUANT ENGINE RULES (they override anything above when they conflict):
 - long_term: setup_id "none"; accumulation framing as before; conviction at most 3 (not backtested).
 - Stocks: if NEXT EARNINGS falls inside a horizon's holding window, say so in that idea and keep conviction ≤ 2.`;
 
-const DEEP_SYSTEM_PROMPT = `You are running in DEEP DIVE mode for an experienced retail trader. The user paid premium Opus tokens — match that expectation with substantially more thorough analysis.
+const DEEP_SYSTEM_PROMPT = `You are running in DEEP DIVE mode for an experienced retail trader. The user chose the premium deep-dive model — match that expectation with substantially more thorough analysis.
 
 THIS IS NON-NEGOTIABLE: an empty or refusing response is treated as a BUG and gets retried at higher cost. Every field below must contain real content. There is no acceptable "I decline" path. Even if every signal is mixed, you produce a watchful-but-committed analysis.
 
@@ -1227,7 +1227,7 @@ analysisRouter.post('/', requireAuth, async (req, res) => {
       try {
         const reminder =
           attempt === 1
-            ? 'Your previous response was degenerate (empty headline / summary / key_levels, or null trade_ideas slots). The user paid Opus tokens — an empty response is unacceptable. Re-submit with: a real headline, a 400+ word summary_markdown referencing specific indicator values, populated support AND resistance arrays, populated risks, AND four fully-formed trade ideas (use the watching-trade example from the system prompt for horizons with no edge — conviction=1, entry_kind="waiting", but still complete).'
+            ? 'Your previous response was degenerate (empty headline / summary / key_levels, or null trade_ideas slots). The user chose the premium deep-dive model — an empty response is unacceptable. Re-submit with: a real headline, a 400+ word summary_markdown referencing specific indicator values, populated support AND resistance arrays, populated risks, AND four fully-formed trade ideas (use the watching-trade example from the system prompt for horizons with no edge — conviction=1, entry_kind="waiting", but still complete).'
             : 'Second attempt was still degenerate. ONE MORE TRY. Be concrete. Copy the watching-trade example from the system prompt verbatim, substituting real numbers (SMA20=0.2110 from the data, etc.). Every field must contain real content.';
         const retryMessage = await client.messages.create({
           model,
